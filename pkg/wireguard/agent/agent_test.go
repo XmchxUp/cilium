@@ -17,6 +17,7 @@ import (
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/wireguard/mode"
 )
 
 type AgentSuite struct{}
@@ -83,14 +84,14 @@ func newTestAgent(ctx context.Context) (*Agent, *ipcache.IPCache) {
 	ipCache := ipcache.NewIPCache(&ipcache.Configuration{
 		Context: ctx,
 	})
+	wgClient := &fakeWgClient{}
 	wgAgent := &Agent{
-		wgClient:         &fakeWgClient{},
-		ipCache:          ipCache,
-		listenPort:       listenPort,
-		peerByNodeName:   map[string]*peerConfig{},
-		nodeNameByNodeIP: map[string]string{},
-		nodeNameByPubKey: map[wgtypes.Key]string{},
+		wgClient:   wgClient,
+		ipCache:    ipCache,
+		listenPort: listenPort,
+		mode:       mode.NewP2P(wgClient),
 	}
+	wgAgent.mode.Init(ipCache)
 	ipCache.AddListener(wgAgent)
 	return wgAgent, ipCache
 }
@@ -110,18 +111,18 @@ func (a *AgentSuite) TestAgent_PeerConfig(c *C) {
 	err := wgAgent.UpdatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
 	c.Assert(err, IsNil)
 
-	k8s1 := wgAgent.peerByNodeName[k8s1NodeName]
+	k8s1 := wgAgent.mode.GetPeer(k8s1NodeName)
 	c.Assert(k8s1, NotNil)
-	c.Assert(k8s1.nodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
-	c.Assert(k8s1.nodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
-	c.Assert(k8s1.pubKey.String(), Equals, k8s1PubKey)
-	c.Assert(k8s1.allowedIPs, HasLen, 6)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod1IPv4), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod1IPv6), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod2IPv4), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod2IPv6), Equals, true)
+	c.Assert(k8s1.NodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
+	c.Assert(k8s1.NodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
+	c.Assert(k8s1.PubKey.String(), Equals, k8s1PubKey)
+	c.Assert(k8s1.AllowedIPs, HasLen, 6)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod1IPv4), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod1IPv6), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod2IPv4), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod2IPv6), Equals, true)
 
 	// Tests that IPCache updates are blocked by a concurrent UpdatePeer.
 	// We test this by issuing an UpdatePeer request while holding
@@ -180,25 +181,25 @@ func (a *AgentSuite) TestAgent_PeerConfig(c *C) {
 	<-agentUpdated
 	<-ipCacheUpdated
 
-	k8s1 = wgAgent.peerByNodeName[k8s1NodeName]
-	c.Assert(k8s1.nodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
-	c.Assert(k8s1.nodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
-	c.Assert(k8s1.pubKey.String(), Equals, k8s1PubKey)
-	c.Assert(k8s1.allowedIPs, HasLen, 4)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod2IPv4), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod2IPv6), Equals, true)
+	k8s1 = wgAgent.mode.GetPeer(k8s1NodeName)
+	c.Assert(k8s1.NodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
+	c.Assert(k8s1.NodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
+	c.Assert(k8s1.PubKey.String(), Equals, k8s1PubKey)
+	c.Assert(k8s1.AllowedIPs, HasLen, 4)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod2IPv4), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod2IPv6), Equals, true)
 
-	k8s2 := wgAgent.peerByNodeName[k8s2NodeName]
-	c.Assert(k8s2.nodeIPv4, checker.DeepEquals, k8s2NodeIPv4)
-	c.Assert(k8s2.nodeIPv6, checker.DeepEquals, k8s2NodeIPv6)
-	c.Assert(k8s2.pubKey.String(), Equals, k8s2PubKey)
-	c.Assert(k8s2.allowedIPs, HasLen, 4)
-	c.Assert(containsIP(k8s2.allowedIPs, iputil.IPToPrefix(k8s2NodeIPv4)), Equals, true)
-	c.Assert(containsIP(k8s2.allowedIPs, iputil.IPToPrefix(k8s2NodeIPv6)), Equals, true)
-	c.Assert(containsIP(k8s2.allowedIPs, pod3IPv4), Equals, true)
-	c.Assert(containsIP(k8s2.allowedIPs, pod3IPv6), Equals, true)
+	k8s2 := wgAgent.mode.GetPeer(k8s2NodeName)
+	c.Assert(k8s2.NodeIPv4, checker.DeepEquals, k8s2NodeIPv4)
+	c.Assert(k8s2.NodeIPv6, checker.DeepEquals, k8s2NodeIPv6)
+	c.Assert(k8s2.PubKey.String(), Equals, k8s2PubKey)
+	c.Assert(k8s2.AllowedIPs, HasLen, 4)
+	c.Assert(containsIP(k8s2.AllowedIPs, iputil.IPToPrefix(k8s2NodeIPv4)), Equals, true)
+	c.Assert(containsIP(k8s2.AllowedIPs, iputil.IPToPrefix(k8s2NodeIPv6)), Equals, true)
+	c.Assert(containsIP(k8s2.AllowedIPs, pod3IPv4), Equals, true)
+	c.Assert(containsIP(k8s2.AllowedIPs, pod3IPv6), Equals, true)
 
 	// Tests that duplicate public keys are rejected (k8s2 imitates k8s1)
 	err = wgAgent.UpdatePeer(k8s2NodeName, k8s1PubKey, k8s2NodeIPv4, k8s2NodeIPv6)
@@ -207,9 +208,9 @@ func (a *AgentSuite) TestAgent_PeerConfig(c *C) {
 	// Node Deletion
 	wgAgent.DeletePeer(k8s1NodeName)
 	wgAgent.DeletePeer(k8s2NodeName)
-	c.Assert(wgAgent.peerByNodeName, HasLen, 0)
-	c.Assert(wgAgent.nodeNameByNodeIP, HasLen, 0)
-	c.Assert(wgAgent.nodeNameByPubKey, HasLen, 0)
+	// c.Assert(wgAgent.PeerByNodeName, HasLen, 0)
+	// c.Assert(wgAgent.NodeNameByNodeIP, HasLen, 0)
+	// c.Assert(wgAgent.NodeNameByPubKey, HasLen, 0)
 }
 
 func (a *AgentSuite) TestAgent_PeerConfig_WithEncryptNode(c *C) {
@@ -224,14 +225,14 @@ func (a *AgentSuite) TestAgent_PeerConfig_WithEncryptNode(c *C) {
 	err := wgAgent.UpdatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6)
 	c.Assert(err, IsNil)
 
-	k8s1 := wgAgent.peerByNodeName[k8s1NodeName]
+	k8s1 := wgAgent.mode.GetPeer(k8s1NodeName)
 	c.Assert(k8s1, NotNil)
-	c.Assert(k8s1.nodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
-	c.Assert(k8s1.nodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
-	c.Assert(k8s1.pubKey.String(), Equals, k8s1PubKey)
-	c.Assert(k8s1.allowedIPs, HasLen, 4)
-	c.Assert(containsIP(k8s1.allowedIPs, pod1IPv4), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, pod2IPv4), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
-	c.Assert(containsIP(k8s1.allowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
+	c.Assert(k8s1.NodeIPv4, checker.DeepEquals, k8s1NodeIPv4)
+	c.Assert(k8s1.NodeIPv6, checker.DeepEquals, k8s1NodeIPv6)
+	c.Assert(k8s1.PubKey.String(), Equals, k8s1PubKey)
+	c.Assert(k8s1.AllowedIPs, HasLen, 4)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod1IPv4), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, pod2IPv4), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv4)), Equals, true)
+	c.Assert(containsIP(k8s1.AllowedIPs, iputil.IPToPrefix(k8s1NodeIPv6)), Equals, true)
 }

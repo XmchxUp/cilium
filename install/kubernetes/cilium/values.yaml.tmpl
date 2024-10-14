@@ -841,6 +841,8 @@ encryption:
     userspaceFallback: false
     # -- Controls Wireguard PersistentKeepalive option. Set 0s to disable.
     persistentKeepalive: 0s
+    # -- Enables the wireguard topology by point-to-point mode or hub-spoke mode.
+    topology: ""
 
   # -- Deprecated in favor of encryption.ipsec.keyFile. To be removed in 1.15.
   # Name of the key file inside the Kubernetes secret configured via secretName.

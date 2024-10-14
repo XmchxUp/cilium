@@ -98,6 +98,8 @@ endif
 		--build-arg CILIUM_SHA=$(firstword $(GIT_VERSION)) \
 		--build-arg OPERATOR_VARIANT=$(IMAGE_NAME) \
 		--build-arg DEBUG_HOLD=$(DEBUG_HOLD) \
+		--build-arg http_proxy="http://fengyang-sun:fengyang-sun@43.4.54.22:10080/" \
+		--build-arg https_proxy="http://fengyang-sun:fengyang-sun@43.4.54.22:10080/" \
 		--target $(5) \
 		-t $(IMAGE_REPOSITORY)/$(IMAGE_NAME)$${UNSTRIPPED}$(DOCKER_IMAGE_SUFFIX):$(4) .
 ifneq ($(KIND_LOAD),)

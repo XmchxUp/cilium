@@ -738,6 +738,9 @@ const (
 	// EnableWireguard is the name of the option to enable WireGuard
 	EnableWireguard = "enable-wireguard"
 
+	// WireguardTopology is the name of the option that enables WireGuard topology for point-to-point mode or hub-spoke mode
+	WireguardTopology = "wireguard-topology"
+
 	// EnableL2Announcements is the name of the option to enable l2 announcements
 	EnableL2Announcements = "enable-l2-announcements"
 
@@ -1710,6 +1713,9 @@ type DaemonConfig struct {
 
 	// WireguardPersistentKeepalive controls Wireguard PersistentKeepalive option.
 	WireguardPersistentKeepalive time.Duration
+
+	// WireguardTopology keep the wireguard topology for point-to-point mode or hub-spoke mode
+	WireguardTopology string
 
 	// EnableL2Announcements enables L2 announcement of service IPs
 	EnableL2Announcements bool
@@ -3015,6 +3021,7 @@ func (c *DaemonConfig) Populate(vp *viper.Viper) {
 	c.IPv6MCastDevice = vp.GetString(IPv6MCastDevice)
 	c.EnableIPSec = vp.GetBool(EnableIPSecName)
 	c.EnableWireguard = vp.GetBool(EnableWireguard)
+	c.WireguardTopology = vp.GetString(WireguardTopology)
 	c.EnableL2Announcements = vp.GetBool(EnableL2Announcements)
 	c.L2AnnouncerLeaseDuration = vp.GetDuration(L2AnnouncerLeaseDuration)
 	c.L2AnnouncerRenewDeadline = vp.GetDuration(L2AnnouncerRenewDeadline)

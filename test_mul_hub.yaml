@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cilium-wireguard-hubspoke
+  namespace: kube-system
+data:
+  TopoMode: "mul-hub-spoke"
+  TopologyConfigYaml: |
+    Connectivity:
+      - area: ["area1", "area2"]
+        gateway: "g1"

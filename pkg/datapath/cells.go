@@ -26,6 +26,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/hive/cell"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/maps"
 	"github.com/cilium/cilium/pkg/maps/eventsmap"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
@@ -122,7 +123,7 @@ var Cell = cell.Module(
 	ipcache.Cell,
 )
 
-func newWireguardAgent(lc cell.Lifecycle) *wg.Agent {
+func newWireguardAgent(lc cell.Lifecycle, clientset k8sClient.Clientset) *wg.Agent {
 	var wgAgent *wg.Agent
 	if option.Config.EnableWireguard {
 		if option.Config.EnableIPSec {
@@ -132,7 +133,7 @@ func newWireguardAgent(lc cell.Lifecycle) *wg.Agent {
 
 		var err error
 		privateKeyPath := filepath.Join(option.Config.StateDir, wgTypes.PrivKeyFilename)
-		wgAgent, err = wg.NewAgent(privateKeyPath)
+		wgAgent, err = wg.NewAgent(privateKeyPath, clientset)
 		if err != nil {
 			log.Fatalf("failed to initialize WireGuard: %s", err)
 		}

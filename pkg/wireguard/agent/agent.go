@@ -10,13 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"strconv"
 
 	"github.com/go-openapi/strfmt"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
@@ -29,7 +26,6 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/annotation"
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
@@ -42,7 +38,10 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/sysctl"
+	"github.com/cilium/cilium/pkg/wireguard/mode"
 	"github.com/cilium/cilium/pkg/wireguard/types"
+
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 )
 
 const (
@@ -50,14 +49,6 @@ const (
 )
 
 var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "wireguard")
-
-// wireguardClient is an interface to mock wgctrl.Client
-type wireguardClient interface {
-	io.Closer
-	Devices() ([]*wgtypes.Device, error)
-	Device(name string) (*wgtypes.Device, error)
-	ConfigureDevice(name string, cfg wgtypes.Config) error
-}
 
 // Agent needs to be initialized with Init(). In Init(), the WireGuard tunnel
 // device will be created and the proper routes set.  During Init(), existing
@@ -67,15 +58,12 @@ type wireguardClient interface {
 type Agent struct {
 	lock.RWMutex
 
-	wgClient   wireguardClient
+	wgClient   mode.WireguardClient
 	ipCache    *ipcache.IPCache
 	listenPort int
 	privKey    wgtypes.Key
 
-	peerByNodeName   map[string]*peerConfig
-	nodeNameByNodeIP map[string]string
-	nodeNameByPubKey map[wgtypes.Key]string
-	restoredPubKeys  map[wgtypes.Key]struct{}
+	mode mode.WireGuardManager
 
 	cleanup []func()
 
@@ -84,7 +72,7 @@ type Agent struct {
 }
 
 // NewAgent creates a new WireGuard Agent
-func NewAgent(privKeyPath string) (*Agent, error) {
+func NewAgent(privKeyPath string, clientset k8sClient.Clientset) (*Agent, error) {
 	key, err := loadOrGeneratePrivKey(privKeyPath)
 	if err != nil {
 		return nil, err
@@ -94,19 +82,21 @@ func NewAgent(privKeyPath string) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	return &Agent{
+	a := &Agent{
 		wgClient:   wgClient,
 		privKey:    key,
 		listenPort: listenPort,
 
-		peerByNodeName:   map[string]*peerConfig{},
-		nodeNameByNodeIP: map[string]string{},
-		nodeNameByPubKey: map[wgtypes.Key]string{},
-		restoredPubKeys:  map[wgtypes.Key]struct{}{},
-
 		cleanup: []func(){},
-	}, nil
+	}
+
+	if option.Config.WireguardTopology != "" { // hub-spoke
+		a.mode = mode.NewMulHubSpoke(wgClient, clientset)
+	} else {
+		a.mode = mode.NewP2P(wgClient)
+	}
+
+	return a, nil
 }
 
 func (a *Agent) Name() string {
@@ -284,12 +274,9 @@ func (a *Agent) Init(ipcache *ipcache.IPCache, mtuConfig mtu.MTU) error {
 		return fmt.Errorf("failed to set link up: %w", err)
 	}
 
-	dev, err := a.wgClient.Device(types.IfaceName)
+	err = a.mode.Init(ipcache)
 	if err != nil {
-		return fmt.Errorf("failed to obtain WireGuard device: %w", err)
-	}
-	for _, peer := range dev.Peers {
-		a.restoredPubKeys[peer.PublicKey] = struct{}{}
+		return err
 	}
 
 	// Delete IP rules and routes installed by the agent to steer a traffic from
@@ -313,21 +300,10 @@ func (a *Agent) RestoreFinished(cm *clustermesh.ClusterMesh) error {
 	a.Lock()
 	defer a.Unlock()
 
-	// Delete obsolete peers
-	for _, p := range a.peerByNodeName {
-		delete(a.restoredPubKeys, p.pubKey)
+	err := a.mode.RestoreFinished()
+	if err != nil {
+		return err
 	}
-	for pubKey := range a.restoredPubKeys {
-		log.WithField(logfields.PubKey, pubKey).Info("Removing obsolete peer")
-		if err := a.deletePeerByPubKey(pubKey); err != nil {
-			return err
-		}
-	}
-
-	a.restoredPubKeys = nil
-
-	log.Debug("Finished restore")
-
 	return nil
 }
 
@@ -341,175 +317,13 @@ func (a *Agent) UpdatePeer(nodeName, pubKeyHex string, nodeIPv4, nodeIPv6 net.IP
 	a.Lock()
 	defer a.Unlock()
 
-	pubKey, err := wgtypes.ParseKey(pubKeyHex)
-	if err != nil {
-		return err
-	}
-
-	if prevNodeName, ok := a.nodeNameByPubKey[pubKey]; ok {
-		if nodeName != prevNodeName {
-			return fmt.Errorf("detected duplicate public key. "+
-				"node %q uses same key as existing node %q", nodeName, prevNodeName)
-		}
-	}
-
-	var allowedIPs []net.IPNet = nil
-	if prev := a.peerByNodeName[nodeName]; prev != nil {
-		// Handle pubKey change
-		if prev.pubKey != pubKey {
-			log.WithField(logfields.NodeName, nodeName).Debug("Pubkey has changed")
-			// pubKeys differ, so delete old peer
-			if err := a.deletePeerByPubKey(prev.pubKey); err != nil {
-				return err
-			}
-		}
-
-		// Reuse allowedIPs from existing peer config
-		allowedIPs = prev.allowedIPs
-
-		// Handle Node IP change
-		if !prev.nodeIPv4.Equal(nodeIPv4) {
-			delete(a.nodeNameByNodeIP, prev.nodeIPv4.String())
-			allowedIPs = nil // reset allowedIPs and re-initialize below
-		}
-		if !prev.nodeIPv6.Equal(nodeIPv6) {
-			delete(a.nodeNameByNodeIP, prev.nodeIPv6.String())
-			allowedIPs = nil // reset allowedIPs and re-initialize below
-		}
-	}
-
-	if allowedIPs == nil {
-		// (Re-)Initialize the allowedIPs list by querying the IPCache. The
-		// allowedIPs will be updated by OnIPIdentityCacheChange after this
-		// function returns.
-		var lookupIPv4, lookupIPv6 net.IP
-		if option.Config.EnableIPv4 && nodeIPv4 != nil {
-			lookupIPv4 = nodeIPv4
-			allowedIPs = append(allowedIPs, net.IPNet{
-				IP:   nodeIPv4,
-				Mask: net.CIDRMask(net.IPv4len*8, net.IPv4len*8),
-			})
-		}
-		if option.Config.EnableIPv6 && nodeIPv6 != nil {
-			lookupIPv6 = nodeIPv6
-			allowedIPs = append(allowedIPs, net.IPNet{
-				IP:   nodeIPv6,
-				Mask: net.CIDRMask(net.IPv6len*8, net.IPv6len*8),
-			})
-		}
-		allowedIPs = append(allowedIPs, a.ipCache.LookupByHostRLocked(lookupIPv4, lookupIPv6)...)
-	}
-
-	ep := ""
-	if option.Config.EnableIPv4 && nodeIPv4 != nil {
-		ep = net.JoinHostPort(nodeIPv4.String(), strconv.Itoa(listenPort))
-	} else if option.Config.EnableIPv6 && nodeIPv6 != nil {
-		ep = net.JoinHostPort(nodeIPv6.String(), strconv.Itoa(listenPort))
-	} else {
-		return fmt.Errorf("missing node IP for node %q", nodeName)
-	}
-
-	epAddr, err := net.ResolveUDPAddr("udp", ep)
-	if err != nil {
-		return fmt.Errorf("failed to resolve peer endpoint address: %w", err)
-	}
-
-	peer := &peerConfig{
-		pubKey:     pubKey,
-		endpoint:   epAddr,
-		nodeIPv4:   nodeIPv4,
-		nodeIPv6:   nodeIPv6,
-		allowedIPs: allowedIPs,
-	}
-
-	log.WithFields(logrus.Fields{
-		logfields.NodeName: nodeName,
-		logfields.PubKey:   pubKeyHex,
-		logfields.NodeIPv4: nodeIPv4,
-		logfields.NodeIPv6: nodeIPv6,
-	}).Debug("Updating peer")
-
-	if err := a.updatePeerByConfig(peer); err != nil {
-		return err
-	}
-
-	a.peerByNodeName[nodeName] = peer
-	a.nodeNameByPubKey[pubKey] = nodeName
-	if nodeIPv4 != nil {
-		a.nodeNameByNodeIP[nodeIPv4.String()] = nodeName
-	}
-	if nodeIPv6 != nil {
-		a.nodeNameByNodeIP[nodeIPv6.String()] = nodeName
-	}
-
-	return nil
+	return a.mode.UpdatePeer(nodeName, pubKeyHex, nodeIPv4, nodeIPv6)
 }
 
 func (a *Agent) DeletePeer(nodeName string) error {
 	a.Lock()
 	defer a.Unlock()
-
-	peer := a.peerByNodeName[nodeName]
-	if peer == nil {
-		return fmt.Errorf("cannot find peer for %q node", nodeName)
-	}
-
-	if err := a.deletePeerByPubKey(peer.pubKey); err != nil {
-		return err
-	}
-
-	delete(a.peerByNodeName, nodeName)
-	delete(a.nodeNameByPubKey, peer.pubKey)
-
-	if peer.nodeIPv4 != nil {
-		delete(a.nodeNameByNodeIP, peer.nodeIPv4.String())
-	}
-	if peer.nodeIPv6 != nil {
-		delete(a.nodeNameByNodeIP, peer.nodeIPv6.String())
-	}
-
-	return nil
-}
-
-func (a *Agent) deletePeerByPubKey(pubKey wgtypes.Key) error {
-	log.WithField(logfields.PubKey, pubKey).Debug("Removing peer")
-
-	peerCfg := wgtypes.PeerConfig{
-		PublicKey: pubKey,
-		Remove:    true,
-	}
-
-	cfg := &wgtypes.Config{Peers: []wgtypes.PeerConfig{peerCfg}}
-	if err := a.wgClient.ConfigureDevice(types.IfaceName, *cfg); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// updatePeerByConfig updates the WireGuard kernel peer config based on peerConfig p
-func (a *Agent) updatePeerByConfig(p *peerConfig) error {
-	peer := wgtypes.PeerConfig{
-		PublicKey:         p.pubKey,
-		Endpoint:          p.endpoint,
-		AllowedIPs:        p.allowedIPs,
-		ReplaceAllowedIPs: true,
-	}
-	if option.Config.WireguardPersistentKeepalive != 0 {
-		peer.PersistentKeepaliveInterval = &option.Config.WireguardPersistentKeepalive
-	}
-	cfg := wgtypes.Config{
-		ReplacePeers: false,
-		Peers:        []wgtypes.PeerConfig{peer},
-	}
-
-	log.WithFields(logrus.Fields{
-		logfields.Endpoint: p.endpoint,
-		logfields.PubKey:   p.pubKey,
-		logfields.IPAddrs:  p.allowedIPs,
-	}).Debug("Updating peer config")
-
-	return a.wgClient.ConfigureDevice(types.IfaceName, cfg)
+	return a.mode.DeletePeer(nodeName)
 }
 
 func loadOrGeneratePrivKey(filePath string) (key wgtypes.Key, err error) {
@@ -535,67 +349,14 @@ func loadOrGeneratePrivKey(filePath string) (key wgtypes.Key, err error) {
 
 // OnIPIdentityCacheChange implements ipcache.IPIdentityMappingListener
 func (a *Agent) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrCluster cmtypes.PrefixCluster, oldHostIP, newHostIP net.IP,
-	_ *ipcache.Identity, _ ipcache.Identity, _ uint8, _ *ipcache.K8sMetadata) {
-	ipnet := cidrCluster.AsIPNet()
-
+	oldID *ipcache.Identity, newID ipcache.Identity, encryptKey uint8, k8sMeta *ipcache.K8sMetadata) {
 	// This function is invoked from the IPCache with the
 	// ipcache.IPIdentityCache lock held. We therefore need to be careful when
 	// calling into ipcache.IPIdentityCache from Agent to avoid potential
 	// deadlocks.
 	a.Lock()
 	defer a.Unlock()
-
-	// We are only interested in IPCache entries where the hostIP is set, i.e.
-	// updates with oldHostIP set for deleted entries and newHostIP set
-	// for newly created entries.
-	// A special case (i.e. an entry without a hostIP) is the remote node entry
-	// itself when node-to-node encryption is enabled. We handle that case in
-	// UpdatePeer(), i.e. we add any required remote node IPs to AllowedIPs
-	// there.
-	// If we do not find a WireGuard peer for a given hostIP, we intentionally
-	// ignore the IPCache upserts here. We instead assume that UpdatePeer() will
-	// eventually be called once a node starts participating in WireGuard
-	// (or if its host IP changed). UpdatePeer initializes the allowedIPs
-	// of newly discovered hostIPs by querying the IPCache, which will contain
-	// all updates we might have skipped here before the hostIP was known.
-	//
-	// Note that we also ignore encryptKey here - it is only used by the
-	// datapath. We only ever add AllowedIPs based on IPCache updates for nodes
-	// which for which we already know the public key. If a node opts out of
-	// encryption, it will not announce it's public key and thus will not be
-	// part of the nodeNameByNodeIP map.
-	var updatedPeer *peerConfig
-	switch {
-	case modType == ipcache.Delete && oldHostIP != nil:
-		if nodeName, ok := a.nodeNameByNodeIP[oldHostIP.String()]; ok {
-			if peer := a.peerByNodeName[nodeName]; peer != nil {
-				if peer.removeAllowedIP(ipnet) {
-					updatedPeer = peer
-				}
-			}
-		}
-	case modType == ipcache.Upsert && newHostIP != nil:
-		if nodeName, ok := a.nodeNameByNodeIP[newHostIP.String()]; ok {
-			if peer := a.peerByNodeName[nodeName]; peer != nil {
-				if peer.insertAllowedIP(ipnet) {
-					updatedPeer = peer
-				}
-			}
-		}
-	}
-
-	if updatedPeer != nil {
-		if err := a.updatePeerByConfig(updatedPeer); err != nil {
-			log.WithFields(logrus.Fields{
-				logfields.Modification: modType,
-				logfields.IPAddr:       ipnet.String(),
-				logfields.OldNode:      oldHostIP,
-				logfields.NewNode:      newHostIP,
-				logfields.PubKey:       updatedPeer.pubKey,
-			}).WithError(err).
-				Error("Failed to update WireGuard peer after ipcache update")
-		}
-	}
+	a.mode.OnIPIdentityCacheChange(modType, cidrCluster, oldHostIP, newHostIP, oldID, newID, encryptKey, k8sMeta)
 }
 
 // Status returns the state of the WireGuard tunnel managed by this instance.
@@ -652,50 +413,6 @@ func (a *Agent) Status(withPeers bool) (*models.WireguardStatus, error) {
 	}
 
 	return status, nil
-}
-
-// peerConfig represents the kernel state of each WireGuard peer.
-// In order to be able to add and remove individual IPs from the
-// `AllowedIPs` list, we store a `peerConfig` for each known WireGuard peer.
-// When a peer is first discovered via node manager, we obtain the remote
-// peers `AllowedIPs` by querying Cilium's user-space copy of the IPCache
-// in the agent. In addition, we also subscribe to IPCache updates in the
-// WireGuard agent and update the `AllowedIPs` list of known peers
-// accordingly.
-type peerConfig struct {
-	pubKey             wgtypes.Key
-	endpoint           *net.UDPAddr
-	nodeIPv4, nodeIPv6 net.IP
-	allowedIPs         []net.IPNet
-}
-
-// removeAllowedIP removes ip from the list of allowedIPs and returns true
-// if the list of allowedIPs changed
-func (p *peerConfig) removeAllowedIP(ip net.IPNet) (updated bool) {
-	filtered := p.allowedIPs[:0]
-	for _, allowedIP := range p.allowedIPs {
-		if cidr.Equal(&allowedIP, &ip) {
-			updated = true
-		} else {
-			filtered = append(filtered, allowedIP)
-		}
-	}
-
-	p.allowedIPs = filtered
-	return updated
-}
-
-// insertAllowedIP inserts ip into the list of allowedIPs and returns true
-// if the list of allowedIPs changed
-func (p *peerConfig) insertAllowedIP(ip net.IPNet) (updated bool) {
-	for _, allowedIP := range p.allowedIPs {
-		if cidr.Equal(&allowedIP, &ip) {
-			return false
-		}
-	}
-
-	p.allowedIPs = append(p.allowedIPs, ip)
-	return true
 }
 
 // Removes < v1.13 IP rules and routes.

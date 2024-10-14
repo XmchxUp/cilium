@@ -605,6 +605,9 @@ data:
     {{- if .Values.encryption.wireguard.persistentKeepalive }}
   wireguard-persistent-keepalive: {{ .Values.encryption.wireguard.persistentKeepalive | quote }}
     {{- end }}
+    {{- if .Values.encryption.wireguard.topology }}
+  wireguard-topology: {{ .Values.encryption.wireguard.topology | quote }}
+    {{- end }}
   {{- end }}
   {{- if .Values.encryption.nodeEncryption }}
   encrypt-node: {{ .Values.encryption.nodeEncryption | quote }}

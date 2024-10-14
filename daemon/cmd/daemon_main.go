@@ -371,6 +371,9 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(option.EnableWireguard, false, "Enable WireGuard")
 	option.BindEnv(vp, option.EnableWireguard)
 
+	flags.String(option.WireguardTopology, "", "WireGuard point-to-point mode or hub-spoke mode")
+	option.BindEnv(vp, option.WireguardTopology)
+
 	flags.Bool(option.EnableL2Announcements, false, "Enable L2 announcements")
 	option.BindEnv(vp, option.EnableL2Announcements)
 
